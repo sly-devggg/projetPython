@@ -1,95 +1,83 @@
-import os
-import re
 import scrapy
-from scrapy.crawler import CrawlerProcess
+import os
 from urllib.parse import urljoin
+from scrapy.crawler import CrawlerProcess
 
-def nettoyer_nom_fichier(s):
-    return re.sub(r'[<>:"/\\|?*#]', '_', s.strip()) # Remplace les caractères interdits par des underscores
+# petite fonction pour éviter les caractères bizarres dans les noms de fichiers
+def clean_nom(nom):
+    return nom.replace('/', '_').replace(':', '').replace('?', '').strip()
 
-class LivresSpider(scrapy.Spider):
-    name = "livres"
-    start_urls = ["https://books.toscrape.com/"]
+class BookSpider(scrapy.Spider):
+    name = 'books'
+    start_urls = ['https://books.toscrape.com']
 
-    def demarrer(self, response):
-        # Récupère les liens de toutes les catégories
-        for cat in response.css('div.side_categories ul li ul li a'):
-            nom_categorie = cat.css('::text').get().strip()
-            url_categorie = urljoin(response.url, cat.attrib['href'])
-            yield scrapy.Request(
-                url_categorie,
-                callback=self.parcourir_categorie,
-                meta={'categorie': nom_categorie}
-            )
+    def parse(self, response):
+        # récup toutes les catégories sur la gauche
+        cats = response.css('.side_categories ul li ul li a')
+        for c in cats:
+            titre = c.css('::text').get().strip()
+            lien = urljoin(response.url, c.attrib['href'])
+            # on passe le nom de la catégorie dans les meta
+            yield scrapy.Request(lien, callback=self.parse_cat, meta={'cat': titre})
 
-    def parcourir_categorie(self, response):
-       # Parcourt les livres dans une catégorie et gère la pagination
-        nom_categorie = response.meta['categorie']
+    def parse_cat(self, response):
+        cat = response.meta['cat']
+        livres = response.css('h3 a')
+        for l in livres:
+            link = urljoin(response.url, l.attrib['href'])
+            yield scrapy.Request(link, callback=self.parse_book, meta={'cat': cat})
 
-        for livre in response.css('h3 a'):
-            url_livre = urljoin(response.url, livre.attrib['href'])
-            yield scrapy.Request(
-                url_livre,
-                callback=self.parcourir_livre,
-                meta={'categorie': nom_categorie}
-            )
+        # vérifie s’il y a une page suivante
+        nextpage = response.css('.next a::attr(href)').get()
+        if nextpage:
+            url_suiv = urljoin(response.url, nextpage)
+            yield scrapy.Request(url_suiv, callback=self.parse_cat, meta={'cat': cat})
 
-        page_suivante = response.css('li.next a::attr(href)').get()
-        if page_suivante:
-            yield scrapy.Request(
-                urljoin(response.url, page_suivante),
-                callback=self.parcourir_categorie,
-                meta={'categorie': nom_categorie}
-            )
+    def parse_book(self, response):
+        cat = response.meta['cat']
+        titre = response.css('h1::text').get()
+        prix = response.css('.price_color::text').get()
+        dispo = response.css('.availability::text').getall()
+        dispo = ''.join([d.strip() for d in dispo if d.strip()])  # nettoie les espaces inutiles
+        note = response.css('p.star-rating::attr(class)').re_first('star-rating (\w+)')
+        upc = response.css('table tr td::text').get()
 
-    def parcourir_livre(self, response):
-        # Extrait les informations du livre
-        categorie = response.meta['categorie']
-        titre = response.css('h1::text').get().strip()
-        prix = response.css('p.price_color::text').get()
-        disponibilite = response.css('p.availability::text').re_first(r'\w+')
-        note = response.css('p.star-rating::attr(class)').re_first(r'star-rating (\w+)')
-        upc = response.css('table tr:nth-child(1) td::text').get()
+        # récupère l’image du livre
+        img_src = response.css('div.item.active img::attr(src)').get()
+        img_url = urljoin(response.url, img_src)
 
-        image_rel = response.css('div.item.active img::attr(src)').get()
-        url_image = urljoin(response.url, image_rel)
+        dossier = f"outputs/img/{cat}"
+        os.makedirs(dossier, exist_ok=True)
+        fichier_img = os.path.join(dossier, clean_nom(titre) + ".jpg")
 
-        dossier_image = os.path.join('outputs', 'images', categorie)
-        os.makedirs(dossier_image, exist_ok=True)
-        chemin_image = os.path.join(dossier_image, f"{nettoyer_nom_fichier(titre)}.jpg")
+        # télécharge l’image
+        yield scrapy.Request(img_url, callback=self.save_img, meta={'fichier': fichier_img}, dont_filter=True)
 
-        # Téléchargement de l'image
-        yield scrapy.Request(
-            url_image,
-            callback=self.sauvegarder_image,
-            meta={'path': chemin_image},
-            dont_filter=True
-        )
-
-        # Données à écrire dans le CSV
         yield {
             'titre': titre,
             'prix': prix,
-            'disponibilite': disponibilite,
+            'dispo': dispo,
             'note': note,
             'upc': upc,
-            'categorie': categorie,
-            'url_page_produit': response.url,
-            'url_image': url_image,
-            'chemin_image': chemin_image
+            'categorie': cat,
+            'url': response.url
         }
 
-    def sauvegarder_image(self, response):
-        # Sauvegarde l'image téléchargée
-        with open(response.meta['path'], 'wb') as f:
+    def save_img(self, response):
+        with open(response.meta['fichier'], 'wb') as f:
             f.write(response.body)
+        # print juste pour vérifier que ça marche
+        print(f"Image sauvegardée : {response.meta['fichier']}")
 
-if __name__ == "__main__":
-    os.makedirs("outputs", exist_ok=True)
+
+if __name__ == '__main__':
+    if not os.path.exists('outputs'):
+        os.mkdir('outputs')
+
     process = CrawlerProcess(settings={
-        "FEEDS": {"outputs/livres.csv": {"format": "csv"}},
-        "LOG_LEVEL": "INFO",
-        "USER_AGENT": "Mozilla/5.0 (compatible; LivresBot/1.0)"
+        'FEEDS': {'outputs/livres.csv': {'format': 'csv'}},
+        'LOG_LEVEL': 'INFO',
+        'USER_AGENT': 'Mozilla/5.0 (X11; Linux x86_64)'
     })
-    process.crawl(LivresSpider)
+    process.crawl(BookSpider)
     process.start()
